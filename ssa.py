@@ -1,745 +1,452 @@
+import pytest
 import torch
+
 import triton
 import triton.language as tl
-from fla.utils import contiguous
-from torch.cuda.amp import custom_bwd, custom_fwd
-from gated_delta_rule_ops.wy_fast import fwd_recompute_w_u, fwd_prepare_wy_repr, bwd_prepare_wy_repr
-from einops import rearrange
-import torch.nn.functional as F 
+import torch.nn.functional as F
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=1),
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32),
-    ],
-    key=["BT", "BK", "BV"], 
-)
+@torch.compile
+def zeropower_via_newtonschulz5(G, steps):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    if G.size(0) > G.size(1):
+        X = X.T
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm() + 1e-7)
+    # Perform the NS iterations
+    for _ in range(steps):
+        A = X @ X.T
+        B = (
+            b * A + c * A @ A
+        )  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X
+
 @triton.jit
-def fwd_prepare_du_kernel(
-    q,
-    k,
-    g,
-    do,
-    dv,
-    s_qk_h,
-    s_qk_t,
-    s_qk_d,
-    s_vo_h,
-    s_vo_t,
-    s_vo_d,
-    T,
-    K,
-    V,
-    scale,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr
+def max_fn(x, y):
+    return tl.math.max(x, y)
+
+
+@triton.jit
+def _fwd_kernel(
+    Q, K, V, sm_scale,
+    L,
+    Out,
+    stride_qz, stride_qh, stride_qm, stride_qk,
+    stride_kz, stride_kh, stride_kn, stride_kk,
+    stride_vz, stride_vh, stride_vk, stride_vn,
+    stride_oz, stride_oh, stride_om, stride_on,
+    Z, H, N_CTX,
+    BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
 ):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
-    
-    b_A = tl.zeros([BT, BT], dtype=tl.float32)
-
-    for i_k in range(tl.cdiv(K, BK)):
-        p_q = tl.make_block_ptr(q + i_bh * s_qk_h, (K, T), (s_qk_d, s_qk_t), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
-        p_k = tl.make_block_ptr(k + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_q = tl.load(p_q, boundary_check=(0, 1)) 
-        b_q = (b_q * scale).to(b_k.dtype)
-        b_A += tl.dot(b_k, b_q, allow_tf32=False)
-    b_g = tl.load(g + i_bh * T + i_t * BT + tl.arange(0, BT))
-    b_A = b_A * tl.math.exp2(b_g[None, :] - b_g[:, None])
-    b_A = tl.where(tl.arange(0, BT)[:, None] <= tl.arange(0, BT)[None, :], b_A , 0).to(do.dtype.element_ty)
-
-    for i_v in range(tl.cdiv(V, BV)):
-        p_do = tl.make_block_ptr(do + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        b_do = tl.load(p_do, boundary_check=(0, 1))
-        p_dv = tl.make_block_ptr(dv + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        b_dv = tl.dot(b_A, b_do, allow_tf32=False)
-        tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
-
-
-
-def fwd_prepare_du(q, k, g, do, BT):
-    dv = torch.empty_like(do)
-    B, H, T, K, V = *k.shape, do.shape[-1]
-    NT = triton.cdiv(T, BT)
-    BK = min(triton.next_power_of_2(K), 64)
-    BV = min(triton.next_power_of_2(V), 64)
-    fwd_prepare_du_kernel[(NT, B*H)](
-        q, k, g, do, dv,
-        k.stride(1), k.stride(2), k.stride(3), 
-        do.stride(1), do.stride(2), do.stride(3),
-        T, K, V, K**-0.5, BT, BK, BV
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+    qvk_offset = off_hz * stride_qh
+    Q_block_ptr = tl.make_block_ptr(
+        base=Q + qvk_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_qm, stride_qk),
+        offsets=(start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, BLOCK_DMODEL),
+        order=(1, 0)
     )
-    return dv
-
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=1),
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32),
-    ],
-    key=["BT", "BK", "BV"], 
-)
-
-@triton.jit
-def chunk_gated_delta_rule_fwd_kernel_h(
-    k,
-    v,
-    w, 
-    v_new,
-    g, 
-    h,
-    initial_state,  # initial state of the chunk [B, H, D_head_K, D_head_V]
-    final_state,  # final state of the chunk [B, H, D_head_K, D_head_V]
-    s_qk_h,
-    s_qk_t,
-    s_qk_d,
-    s_vo_h,
-    s_vo_t,
-    s_vo_d,
-    s_h_h,
-    s_h_t,
-    H: tl.constexpr,
-    T: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BC: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    NT: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,
-    STORE_FINAL_STATE: tl.constexpr
-):
-    i_k, i_v, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-
-    # [BK, BV]
-    b_h = tl.zeros([BK, BV], dtype=tl.float32)
-
-    if USE_INITIAL_STATE:
-        p_h0 = tl.make_block_ptr(initial_state + i_bh * K * V, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0))
-        b_h = tl.load(p_h0, boundary_check=(0, 1)).to(tl.float32)
-
-    for i_t in range(NT):
-        p_h = tl.make_block_ptr(h + i_bh * s_h_h + i_t * K * V, (K, V), (s_h_t, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0))
-        tl.store(p_h, b_h.to(p_h.dtype.element_ty), boundary_check=(0, 1))
-        b_h_cumsum = tl.zeros([BK, BV], dtype=tl.float32)
-        b_g_last = tl.load(g + i_bh * T + i_t * BT + BT - 1)
-        
-        # since we need to make all DK in the SRAM. we face serve SRAM memory burden. By subchunking we allievate such burden
-        for i_c in range(tl.cdiv(BT, BC)):
-            p_k = tl.make_block_ptr(k + i_bh * s_qk_h, (K, T), (s_qk_d, s_qk_t), (i_k * BK, i_t * BT + i_c * BC), (BK, BC), (0, 1))
-            p_w = tl.make_block_ptr(w + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT + i_c * BC, i_k * BK), (BC, BK), (1, 0))
-            p_v = tl.make_block_ptr(v + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT + i_c * BC, i_v * BV), (BC, BV), (1, 0))            
-            b_g = tl.load(g + i_bh * T + i_t * BT + i_c * BC + tl.arange(0, BC)) 
-            p_v_new = tl.make_block_ptr(v_new + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT + i_c * BC, i_v * BV), (BC, BV), (1, 0))   
-            b_k = tl.load(p_k, boundary_check=(0, 1))
-            # [BT, BK]
-            b_w = tl.load(p_w, boundary_check=(0, 1))
-            b_w = (b_w * tl.math.exp2(b_g)[:, None]).to(b_k.dtype)
-            # [BT, BV]
-            b_v = tl.load(p_v, boundary_check=(0, 1))
-            b_v -= tl.dot(b_w, b_h.to(b_k.dtype), allow_tf32=False)
-            # [BK, BV]
-            tl.store(p_v_new, b_v.to(p_v_new.dtype.element_ty), boundary_check=(0, 1))
-            b_k = (b_k * tl.math.exp2(b_g_last - b_g)[None, :]).to(p_k.dtype.element_ty)
-            b_h_cumsum += tl.dot(b_k, b_v.to(b_k.dtype), allow_tf32=False)        
-        b_h *= tl.math.exp2(b_g_last)
-        b_h += b_h_cumsum      
-        
-    if STORE_FINAL_STATE:
-        p_ht = tl.make_block_ptr(final_state + i_bh * K * V, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0))
-        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
-
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=1),
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32),
-    ],
-    key=["BT", "BK", "BV"], 
-)
-# @triton.jit
-# def chunk_linear_attn_fwd_kernel_o(
-#     q,
-#     k,
-#     v,
-#     g,
-#     h,
-#     o,
-#     s_qk_h,
-#     s_qk_t,
-#     s_qk_d,
-#     s_vo_h,
-#     s_vo_t,
-#     s_vo_d,
-#     s_h_h,
-#     s_h_t,
-#     scale,
-#     H: tl.constexpr,
-#     T: tl.constexpr,
-#     K: tl.constexpr,
-#     V: tl.constexpr,
-#     BT: tl.constexpr,
-#     BK: tl.constexpr,
-#     BV: tl.constexpr
-# ):
-#     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-
-#     o_i = tl.arange(0, BT)
-
-#     b_o = tl.zeros([BT, BV], dtype=tl.float32)
-#     b_s = tl.zeros([BT, BT], dtype=tl.float32)
-#     for i_k in range(tl.cdiv(K, BK)):
-#         p_q = tl.make_block_ptr(q + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-#         p_k = tl.make_block_ptr(k + i_bh * s_qk_h, (K, T), (s_qk_d, s_qk_t), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
-#         p_h = tl.make_block_ptr(h + i_bh * s_h_h + i_t * K * V, (K, V), (s_h_t, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0))
-#         # [BT, BK]
-#         b_q = tl.load(p_q, boundary_check=(0, 1)) 
-#         b_q = (b_q * scale).to(b_q.dtype)
-#         # [BK, BT]
-#         b_k = tl.load(p_k, boundary_check=(0, 1))
-#         # [BK, BV]
-#         b_h = tl.load(p_h, boundary_check=(0, 1))
-#         b_o += tl.dot(b_q, b_h, allow_tf32=False)
-#         b_s += tl.dot(b_q, b_k, allow_tf32=False)
-
-#     p_g = g + i_bh * T + i_t * BT + tl.arange(0, BT)
-#     b_g = tl.load(p_g)
-#     b_o = b_o * tl.math.exp2(b_g)[:, None]
-#     b_s = b_s * tl.math.exp2(b_g[:, None] - b_g[None, :])
-#     m_s = o_i[:, None] >= o_i[None, :]
-#     b_s = tl.where(m_s, b_s, 0)
-#     p_v = tl.make_block_ptr(v + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-#     b_v = tl.load(p_v, boundary_check=(0, 1))
-#     b_o = (b_o + tl.dot(b_s.to(b_v.dtype), b_v, allow_tf32=False)) 
-#     p_o = tl.make_block_ptr(o + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-#     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
-@triton.jit
-def chunk_linear_attn_fwd_kernel_o(
-    q,
-    k,
-    v,
-    g,
-    h,
-    o,
-    s_qk_h,
-    s_qk_t,
-    s_qk_d,
-    s_vo_h,
-    s_vo_t,
-    s_vo_d,
-    s_h_h,
-    s_h_t,
-    scale,
-    H: tl.constexpr,
-    T: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr
-):
-    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-
-    o_i = tl.arange(0, BT)
-
-    b_o = tl.zeros([BT, BV], dtype=tl.float32)
-    b_s = tl.zeros([BT, BT], dtype=tl.float32)
-
-    m_i = tl.zeros([BT], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BT], dtype=tl.float32)
-
-
-    for i_k in range(tl.cdiv(K, BK)):
-        p_q = tl.make_block_ptr(q + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_k = tl.make_block_ptr(k + i_bh * s_qk_h, (K, T), (s_qk_d, s_qk_t), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
-        p_h = tl.make_block_ptr(h + i_bh * s_h_h + i_t * K * V, (K, V), (s_h_t, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0))
-        # [BT, BK]
-        b_q = tl.load(p_q, boundary_check=(0, 1))
-        b_q = (b_q * scale).to(b_q.dtype)
-        # [BK, BT]
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        # [BK, BV]
-        b_h = tl.load(p_h, boundary_check=(0, 1))
-        # [BT, BV]
-        b_v = tl.dot(b_k.trans(0, 1), b_h, allow_tf32=False) # block K @ block h
-
-        qk = tl.zeros([BT, BT], dtype=tl.float32)
-        qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf")) # always assume causality
-        qk += tl.dot(b_q, b_k)
-
-        # --- compute scaling constant ---
+    K_block_ptr = tl.make_block_ptr(
+        base=K + qvk_offset,
+        shape=(BLOCK_DMODEL, N_CTX),
+        strides=(stride_kk, stride_kn),
+        offsets=(0, 0),
+        block_shape=(BLOCK_DMODEL, BLOCK_N),
+        order=(0, 1)
+    )
+    V_block_ptr = tl.make_block_ptr(
+        base=V + qvk_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_vk, stride_vn),
+        offsets=(0, 0),
+        block_shape=(BLOCK_N, BLOCK_DMODEL),
+        order=(1, 0)
+    )
+    # initialize offsets
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    # initialize pointer to m and l
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+    # scale sm_scale by log_2(e) and use
+    # 2^x instead of exp in the loop because CSE and LICM
+    # don't work as expected with `exp` in the loop
+    qk_scale = sm_scale * 1.44269504
+    # load q: it will stay in SRAM throughout
+    q = tl.load(Q_block_ptr)
+    q = (q * qk_scale).to(tl.float16)
+    # loop over k, v and update accumulator
+    lo = 0
+    hi = (start_m + 1) * BLOCK_M if IS_CAUSAL else N_CTX
+    for start_n in range(lo, hi, BLOCK_N):
+        # -- load k, v --
+        k = tl.load(K_block_ptr)
+        v = tl.load(V_block_ptr)
+        # -- compute qk ---
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        if IS_CAUSAL:
+            qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
+        qk += tl.dot(q, k)
+        # -- compute scaling constant ---
         m_i_new = tl.maximum(m_i, tl.max(qk, 1))
-        alpha = tl.math.exp2(m_1 - m_i_new)
+        alpha = tl.math.exp2(m_i - m_i_new)
         p = tl.math.exp2(qk - m_i_new[:, None])
-
         # -- scale and update acc --
-        acc_scale = l_i * 0 + alpha
-        b_o *= acc_scale[:, None]
-        b_o += tl.dot(p.to(tl.float16), b_v)
-
-
+        acc_scale = l_i * 0 + alpha  # workaround some compiler bug
+        acc *= acc_scale[:, None]
+        acc += tl.dot(p.to(tl.float16), v)
         # -- update m_i and l_i --
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_i_new
-        
-        
-        b_o += tl.dot(b_q, b_h, allow_tf32=False)
-        b_s += tl.dot(b_q, b_k, allow_tf32=False)
+        # update pointers
+        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
     # write back l and m
-    b_o = b_o / l_i[:, None]
+    acc = acc / l_i[:, None]
     l_ptrs = L + off_hz * N_CTX + offs_m
     tl.store(l_ptrs, m_i + tl.math.log2(l_i))
-
-    p_g = g + i_bh * T + i_t * BT + tl.arange(0, BT)
-    b_g = tl.load(p_g)
-    b_o = b_o * tl.math.exp2(b_g)[:, None]
-    b_s = b_s * tl.math.exp2(b_g[:, None] - b_g[None, :])
-    m_s = o_i[:, None] >= o_i[None, :]
-    b_s = tl.where(m_s, b_s, 0)
-    p_v = tl.make_block_ptr(v + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-    b_v = tl.load(p_v, boundary_check=(0, 1))
-    b_o = (b_o + tl.dot(b_s.to(b_v.dtype), b_v, allow_tf32=False)) 
-    p_o = tl.make_block_ptr(o + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+    # write back O
+    O_block_ptr = tl.make_block_ptr(
+        base=Out + qvk_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_om, stride_on),
+        offsets=(start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, BLOCK_DMODEL),
+        order=(1, 0)
+    )
+    tl.store(O_block_ptr, acc.to(tl.float16))
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=1),
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32),
-    ],
-    key=["BT", "BK", "BV"], 
-)
 @triton.jit
-def chunk_gated_delta_rule_bwd_kernel_dhu(
-    q,
-    k,
-    w,
-    g,
-    do,
-    dh,
-    dv,
-    dv2,
-    s_qk_h,
-    s_qk_t,
-    s_qk_d,
-    s_vo_h,
-    s_vo_t,
-    s_vo_d,
-    s_h_h,
-    s_h_t,
-    scale,
-    H: tl.constexpr,
-    T: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BC: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    NT: tl.constexpr
+def _bwd_preprocess(
+    Out, DO,
+    Delta,
+    BLOCK_M: tl.constexpr, D_HEAD: tl.constexpr,
 ):
-    i_k, i_v, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    off_n = tl.arange(0, D_HEAD)
+    # load
+    o = tl.load(Out + off_m[:, None] * D_HEAD + off_n[None, :]).to(tl.float32)
+    do = tl.load(DO + off_m[:, None] * D_HEAD + off_n[None, :]).to(tl.float32)
+    # compute
+    delta = tl.sum(o * do, axis=1)
+    # write-back
+    tl.store(Delta + off_m, delta)
 
-    # [BK, BV]
-    b_dh = tl.zeros([BK, BV], dtype=tl.float32)
-    for i_t in range(NT - 1, -1, -1):
-        p_dh = tl.make_block_ptr(dh + i_bh * s_h_h + i_t * K * V, (K, V), (s_h_t, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0))
-        tl.store(p_dh, b_dh.to(p_dh.dtype.element_ty), boundary_check=(0, 1))
-        b_dh_tmp = tl.zeros([BK, BV], dtype=tl.float32)
 
-        bg_last = tl.load(g + i_bh * T + i_t * BT + BT - 1)
-        for i_c in range(tl.cdiv(BT, BC) - 1, -1, -1):
-            p_q = tl.make_block_ptr(q + i_bh * s_qk_h, (K, T), (s_qk_d, s_qk_t), (i_k * BK, i_t * BT + i_c * BC), (BK, BC), (0, 1))
-            p_k = tl.make_block_ptr(k + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT + i_c * BC, i_k * BK), (BC, BK), (1, 0))
-            p_w = tl.make_block_ptr(w + i_bh * s_qk_h, (K, T), (s_qk_d, s_qk_t), (i_k * BK, i_t * BT + i_c * BC), (BK, BC), (0, 1))
-            p_dv = tl.make_block_ptr(dv + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT + i_c * BC, i_v * BV), (BC, BV), (1, 0))
-            p_do = tl.make_block_ptr(do + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT + i_c * BC, i_v * BV), (BC, BV), (1, 0))
-            b_g = tl.load(g + i_bh * T + i_t * BT + i_c * BC + tl.arange(0, BC))
-            # [BK, BT]
-            b_q = tl.load(p_q, boundary_check=(0, 1))
-            b_q = (b_q * scale * tl.math.exp2(b_g)[None, :]).to(b_q.dtype)
-            b_do = tl.load(p_do, boundary_check=(0, 1))
-            b_dh_tmp += tl.dot(b_q, b_do.to(b_q.dtype), allow_tf32=False) 
-            # b_q = b_do = None
-            # [BT, BK]
-
-            b_k = tl.load(p_k, boundary_check=(0, 1))            
-            b_k = (b_k * tl.math.exp2(bg_last - b_g)[:, None]).to(b_k.dtype)            
-            b_w = tl.load(p_w, boundary_check=(0, 1))        
-            b_w = (b_w * tl.math.exp2(b_g)[None, :]).to(b_w.dtype)
-            # [BT, V]
-            b_dv = tl.load(p_dv, boundary_check=(0, 1))
-            b_dv += tl.dot(b_k, b_dh.to(b_k.dtype), allow_tf32=False)
-            p_dv2 = tl.make_block_ptr(dv2 + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT + i_c * BC, i_v * BV), (BC, BV), (1, 0))
-            tl.store(p_dv2, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
-            # [BK, BV]
-            b_dh_tmp -= tl.dot(b_w, b_dv.to(b_q.dtype), allow_tf32=False)
-
-        b_dh *= tl.math.exp2(bg_last)
-        b_dh += b_dh_tmp
-
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=1),
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32),
-    ],
-    key=["BT", "BK", "BV"], 
-)
 @triton.jit
-def chunk_gated_delta_rule_bwd_kernel_dqkw(
-    q,
-    k,
-    v,
-    w, 
-    g,
-    h,
-    do,
-    dh,
-    dq,
-    dk,
-    dv,
-    dw,
-    dg,
-    s_qk_h,
-    s_qk_t,
-    s_qk_d,
-    s_vo_h,
-    s_vo_t,
-    s_vo_d,
-    s_h_h,
-    s_h_t,
-    scale,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    T: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    NT: tl.constexpr
+def _bwd_kernel(
+    Q, K, V, sm_scale, Out, DO,
+    DQ, DK, DV,
+    L,
+    D,
+    stride_qz, stride_qh, stride_qm, stride_qk,
+    stride_kz, stride_kh, stride_kn, stride_kk,
+    stride_vz, stride_vh, stride_vk, stride_vn,
+    Z, H, N_CTX,
+    num_block,
+    BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    CAUSAL: tl.constexpr,
 ):
-    i_k, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    o_i = tl.arange(0, BT)
-    
-    b_dq = tl.zeros([BT, BK], dtype=tl.float32)
-    b_dk = tl.zeros([BT, BK], dtype=tl.float32)
-    b_dw = tl.zeros([BT, BK], dtype=tl.float32)
-    b_ds = tl.zeros([BT, BT], dtype=tl.float32)
+    off_hz = tl.program_id(0)
+    off_z = off_hz // H
+    off_h = off_hz % H
+    qk_scale = sm_scale * 1.44269504
+    # offset pointers for batch/head
+    Q += off_z * stride_qz + off_h * stride_qh
+    K += off_z * stride_qz + off_h * stride_qh
+    V += off_z * stride_qz + off_h * stride_qh
+    DO += off_z * stride_qz + off_h * stride_qh
+    DQ += off_z * stride_qz + off_h * stride_qh
+    DK += off_z * stride_qz + off_h * stride_qh
+    DV += off_z * stride_qz + off_h * stride_qh
+    for start_n in range(0, num_block):
+        if CAUSAL:
+            lo = start_n * BLOCK_M
+        else:
+            lo = 0
+        # initialize row/col offsets
+        offs_qm = lo + tl.arange(0, BLOCK_M)
+        offs_n = start_n * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_m = tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_DMODEL)
+        # initialize pointers to value-like data
+        q_ptrs = Q + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        k_ptrs = K + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
+        v_ptrs = V + (offs_n[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        do_ptrs = DO + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        dq_ptrs = DQ + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        # pointer to row-wise quantities in value-like data
+        D_ptrs = D + off_hz * N_CTX
+        l_ptrs = L + off_hz * N_CTX
+        # initialize dv amd dk
+        dv = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+        dk = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+        # k and v stay in SRAM throughout
+        k = tl.load(k_ptrs)
+        v = tl.load(v_ptrs)
+        # loop over rows
+        for start_m in range(lo, num_block * BLOCK_M, BLOCK_M):
+            offs_m_curr = start_m + offs_m
+            # load q, k, v, do on-chip
+            q = tl.load(q_ptrs)
+            # recompute p = softmax(qk, dim=-1).T
+            if CAUSAL:
+                qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), float(0.), float("-inf"))
+            else:
+                qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+            qk += tl.dot(q, tl.trans(k))
+            qk *= qk_scale
+            l_i = tl.load(l_ptrs + offs_m_curr)
+            p = tl.math.exp2(qk - l_i[:, None])
+            # compute dv
+            do = tl.load(do_ptrs)
+            dv += tl.dot(tl.trans(p.to(Q.dtype.element_ty)), do)
+            # compute dp = dot(v, do)
+            Di = tl.load(D_ptrs + offs_m_curr)
+            dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - Di[:, None]
+            dp += tl.dot(do, tl.trans(v))
+            # compute ds = p * (dp - delta[:, None])
+            ds = p * dp * sm_scale
+            # compute dk = dot(ds.T, q)
+            dk += tl.dot(tl.trans(ds.to(Q.dtype.element_ty)), q)
+            # compute dq
+            dq = tl.load(dq_ptrs)
+            dq += tl.dot(ds.to(Q.dtype.element_ty), k)
+            tl.store(dq_ptrs, dq)
+            # increment pointers
+            dq_ptrs += BLOCK_M * stride_qm
+            q_ptrs += BLOCK_M * stride_qm
+            do_ptrs += BLOCK_M * stride_qm
+        # write-back
+        dv_ptrs = DV + (offs_n[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        dk_ptrs = DK + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
+        tl.store(dv_ptrs, dv)
+        tl.store(dk_ptrs, dk)
 
-    b_dg_last = tl.zeros([1,], dtype=tl.float32)
-    b_dg = tl.zeros([BT, ], dtype=tl.float32)
-    b_g_last = tl.load(g + i_bh * T + i_t * BT + BT - 1)
 
-    for i_v in range(tl.cdiv(V, BV)):
-        p_v = tl.make_block_ptr(v + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        p_h = tl.make_block_ptr(h + i_bh * s_h_h, (V, NT * K), (1, s_h_t), (i_v * BV, i_t * K + i_k * BK), (BV, BK), (0, 1))
-        p_do = tl.make_block_ptr(do + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        p_dh = tl.make_block_ptr(dh + i_bh * s_h_h, (V, NT * K), (1, s_h_t), (i_v * BV, i_t * K + i_k * BK), (BV, BK), (0, 1))
-        p_dv = tl.make_block_ptr(dv + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        # [BT, BV]
-        b_v = tl.load(p_v, boundary_check=(0, 1))
-        b_do = tl.load(p_do, boundary_check=(0, 1))
-        # [BV, BK]
-        b_h = tl.load(p_h, boundary_check=(0, 1))
-        # [BK, BV]
-        b_dh = tl.load(p_dh, boundary_check=(0, 1))
-        # [BT]        
-        b_dg_last += (tl.sum(b_h * b_dh))               
-        # [BT, BT]
-        b_ds += tl.dot(b_do, tl.trans(b_v), allow_tf32=False)
-        # [BT, BK]
-        b_dq += tl.dot(b_do, b_h.to(b_do.dtype), allow_tf32=False)  
-        b_dk += tl.dot(b_v, b_dh.to(b_v.dtype), allow_tf32=False)
-        b_dv = tl.load(p_dv, boundary_check=(0, 1))
-        b_dw += tl.dot(b_dv.to(b_v.dtype), b_h.to(b_v.dtype), allow_tf32=False)
-    b_dg_last *= tl.math.exp2(b_g_last)
-    p_q = tl.make_block_ptr(q + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-    p_k = tl.make_block_ptr(k + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-    p_w = tl.make_block_ptr(w + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-    b_q = tl.load(p_q, boundary_check=(0, 1))
-    b_k = tl.load(p_k, boundary_check=(0, 1))
-    b_g = tl.load(g + i_bh * T + i_t * BT + tl.arange(0, BT))    
-    b_w = tl.load(p_w, boundary_check=(0, 1))
-
-    b_g_exp_qw = tl.math.exp2(b_g)
-    b_dq *= b_g_exp_qw[:, None] * scale
-    b_dg += tl.sum(b_dq * b_q, axis=1)
-    b_dw *= b_g_exp_qw[:, None]
-    b_dg -= tl.sum(b_dw * b_w, axis=1)
-    b_dk *= tl.math.exp2(b_g_last - b_g)[:, None]
-    b_dg -= tl.sum(b_dk * b_k, axis=1)
-    b_dg_last += tl.sum(b_dk * b_k)
-    b_g_exp_qw = None
-    # [BT, BT]
-    b_ds = tl.where(o_i[:, None] >= o_i[None, :], b_ds * scale * tl.math.exp2(b_g[:, None] - b_g[None, :]), 0).to(b_q.dtype)
-    # gradient wrt
-    b_dg_mask = tl.dot(b_q, tl.trans(b_k), allow_tf32=False) * b_ds 
-    b_dg += tl.sum(b_dg_mask, axis=1)
-    b_dg -= tl.sum(b_dg_mask, axis=0)
+empty = torch.empty(128, device="cuda")
 
 
-    # [BT, BK]
-    b_dq += tl.dot(b_ds, b_k, allow_tf32=False)
-    b_dk += tl.trans(tl.dot(tl.trans(b_q), b_ds, allow_tf32=False))
+class _attention(torch.autograd.Function):
 
-    p_dq = tl.make_block_ptr(dq + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-    p_dk = tl.make_block_ptr(dk + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-    p_dw = tl.make_block_ptr(dw + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-    tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_dw, -b_dw.to(p_dw.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(dg + (i_bh + i_k * B*H)* T + i_t * BT + tl.arange(0, BT), b_dg)
-    tl.debug_barrier()
-    b_dg_last_prev = tl.load(dg + (i_bh + i_k * B*H)* T + i_t * BT + BT - 1 )
-    b_dg_last += b_dg_last_prev
-    tl.store(dg + (i_bh + i_k * B*H)* T + i_t * BT + BT - 1 + tl.arange(0, 1), b_dg_last)
+    @staticmethod
+    def forward(ctx, q, k, v, g, beta, causal, sm_scale):
+        # shape constraints
+        Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
+        assert Lq == Lk and Lk == Lv
+        assert Lk in {16, 32, 64, 128}
+        o = torch.empty_like(q)
+        BLOCK_M = 128
+        BLOCK_N = 64
+        grid = (triton.cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
+        L = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
 
+        num_warps = 4 if Lk <= 64 else 8
+        _fwd_kernel[grid](
+            q, k, v, g, beta, sm_scale,
+            L,
+            o,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+            q.shape[0], q.shape[1], q.shape[2],
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=Lk,
+            IS_CAUSAL=causal,
+            num_warps=num_warps,
+            num_stages=4)
 
-def chunk_fwd_h_fn(k, w, u, g, BT, initial_state, final_state, state_in_fp32=False):
-    B, H, T, K, V = *k.shape, u.shape[-1]
+        ctx.save_for_backward(q, k, v, o, L)
+        ctx.grid = grid
+        ctx.sm_scale = sm_scale
+        ctx.BLOCK_DMODEL = Lk
+        ctx.causal = causal
+        return o
 
-    BK = triton.next_power_of_2(K)
-    assert BK <= 256, "current kernel does not support head dimension larger than 256."
-    BV = 16 if BK > 128 else 32        
-    BV = 64 if BK <= 64 else BV
-    BC = 16 if BK > 128 else 32 
-    BC = 64 if BK <= 64 else BC
-    BC = min(BT, BC)
-    NT, NK, NV = triton.cdiv(T, BT), triton.cdiv(K, BK), triton.cdiv(V, BV)
-    assert NK == 1, 'NK > 1 is not supported because it involves time-consuming synchronization'
-
-    h = k.new_empty(B, H, NT * K, V)
-    if state_in_fp32:
-        h = h.float()
-    grid = (NK, NV, B * H)
-    v_new = torch.empty_like(u)
-    chunk_gated_delta_rule_fwd_kernel_h[grid](
-        k, u, w, v_new, g, h, initial_state, final_state,
-        k.stride(1), k.stride(2), k.stride(3),
-        u.stride(1), u.stride(2), u.stride(3),
-        h.stride(1), h.stride(2),
-        H=H, T=T, K=K, V=V, BT=BT, BC=BC, BK=BK, BV=BV, NT=NT,
-        USE_INITIAL_STATE=initial_state is not None,
-        STORE_FINAL_STATE=final_state is not None,
+    @staticmethod
+    def backward(ctx, do):
+        BLOCK = 128
+        q, k, v, o, L = ctx.saved_tensors
+        do = do.contiguous()
+        dq = torch.zeros_like(q, dtype=torch.float32)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        delta = torch.empty_like(L)
+        _bwd_preprocess[(ctx.grid[0] * ctx.grid[1], )](
+            o, do,
+            delta,
+            BLOCK_M=BLOCK, D_HEAD=ctx.BLOCK_DMODEL,
         )
-    return h, v_new
-    
-
-def chunk_bwd_dhu_fn(q, k, w, g, do, dv, BT):
-    B, H, T, K, V = *q.shape, do.shape[-1]
-
-    BK = triton.next_power_of_2(K)
-    assert BK <= 256, "current kernel does not support head dimension being larger than 256."
-    BV = 16 if BK > 128 else 32        
-    BV = 64 if BK <= 64 else BV
-    BC = 16 if BK > 128 else 32 
-    BC = 64 if BK <= 64 else BC
-    BC = min(BT, BC)
-    NT, NK, NV = triton.cdiv(T, BT), triton.cdiv(K, BK), triton.cdiv(V, BV)
-    assert NK == 1, 'NK > 1 is not supported because it involves time-consuming synchronization'
-
-    # always state in fp32.
-    dh = q.new_empty(B, H, NT * K, V, dtype=torch.float32)
-    # dv_new = torch.empty_like(do)
-    grid = (NK, NV, B * H)
-    dv2 = torch.empty_like(dv)
-    chunk_gated_delta_rule_bwd_kernel_dhu[grid](
-        q, k, w, g, do, dh, dv, dv2,
-        q.stride(1), q.stride(2), q.stride(3),
-        do.stride(1), do.stride(2), do.stride(3),
-        dh.stride(1), dh.stride(2),
-        K**-0.5,
-        H=H, T=T, K=K, V=V, BT=BT, BC=BC, BK=BK, BV=BV, NT=NT,
-    )
-    return dh, dv2
+        _bwd_kernel[(ctx.grid[1],)](
+            q, k, v, ctx.sm_scale,
+            o, do,
+            dq, dk, dv,
+            L, delta,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            q.shape[0], q.shape[1], q.shape[2],
+            ctx.grid[0],
+            BLOCK_M=BLOCK, BLOCK_N=BLOCK,
+            BLOCK_DMODEL=ctx.BLOCK_DMODEL, num_warps=8,
+            CAUSAL=ctx.causal,
+            num_stages=1,
+        )
+        return dq, dk, dv, None, None
 
 
-def chunk_fwd_o_fn(q, k, v_new, g, h, BT):
-    B, H, T, K, V = *q.shape, v_new.shape[-1]
-
-    BK = triton.next_power_of_2(K)
-    o = torch.empty_like(v_new)
-    BK = min(triton.next_power_of_2(K), 64)
-    BV = min(triton.next_power_of_2(K), 64)
-    NV = triton.cdiv(V, BV)
-    NT = triton.cdiv(T, BT)
-    grid = (NV, NT, B * H)
-    chunk_linear_attn_fwd_kernel_o[grid](
-            q, k, v_new, g, h, o,
-            q.stride(1), q.stride(2), q.stride(3),
-            v_new.stride(1), v_new.stride(2), v_new.stride(3),
-            h.stride(1), h.stride(2),
-            scale=K**-0.5,
-            H=H, T=T, K=K, V=V, BT=BT, BK=BK, BV=BV,
-    )
-    return o
+attention = _attention.apply
 
 
-
-def chunk_bwd_dqkw_fn(q, k, v_new, w, g, h, du, do, dh, BT):
-    B, H, T, K, V = *q.shape, v_new.shape[-1]
-
-    BK = triton.next_power_of_2(K)
-    BK = min(triton.next_power_of_2(K), 64)
-    BV = min(triton.next_power_of_2(V), 64)
-    NK = triton.cdiv(K, BK)
-    NT = triton.cdiv(T, BT)
-    grid = (NK, NT, B * H)
-    dq = torch.empty_like(q)
-    dk = torch.empty_like(k) 
-    dw = torch.empty_like(w) 
-    dg = torch.zeros(NK, *g.shape, dtype=torch.float32, device=g.device)
-    chunk_gated_delta_rule_bwd_kernel_dqkw[grid](
-        q, k, v_new, w, g, h, do, dh, dq, dk, du, dw, dg,
-        q.stride(1), q.stride(2), q.stride(3),
-        v_new.stride(1), v_new.stride(2), v_new.stride(3),
-        dh.stride(1), dh.stride(2),
-        scale = K ** -0.5,
-        B=B, H=H, T=T, K=K, V=V, BT=BT, BK=BK, BV=BV, NT=NT,
-    )
-    dg = dg.sum(0)
-    return dq, dk, dw, dg
-
-
-class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
-
-    @staticmethod
-    @custom_fwd
-    @contiguous
-    def forward(ctx, q, k, v, beta, g, BT, initial_state, output_final_state):        
-        g = g.float()
-        #currently we force the length to be multiple of BT
-        # assert g.shape[-1] % BT == 0
-        g = rearrange(g, 'b h (n c) -> b h n c', c=BT)
-        # change the base of log from e to 2, i.e., ln->log2. To use tl.math.exp2 inside the kernel. 
-        g = g.cumsum(-1) * 1.44269504
-        g = rearrange(g, 'b h n c -> b h (n c)')
-
-        ### obtain WY representation. u is actually the new v.
-        w, u, A_w, A_u, A_w_original, A_u_original = fwd_prepare_wy_repr(k, v, beta, g, BT)
-        ### forward_h 
-        final_state = None
-        # state will convert to bf16 to do matmul anyway so we don't need fp32 state in the forward pass.
-        h, v_new = chunk_fwd_h_fn(k, w, u, g, BT, initial_state, final_state, state_in_fp32=False)                
-        ## obtain output 
-        o = chunk_fwd_o_fn(q, k, v_new, g, h, BT)
-        # save memory
-        # if checkpoint_level == 1:
-        # always save memory
-        h, v_new = None, None
-        ctx.save_for_backward(q, k, v, beta, g, A_w, A_u, A_w_original, A_u_original, h, v_new, initial_state)
-        ctx.BT = BT
-        return o.to(q.dtype), final_state
-
-    @staticmethod
-    @custom_bwd
-    @contiguous
-    def backward(ctx, do, d_ht=None):
-        q, k, v, beta, g, A_w, A_u, A_w_original, A_u_original, h, v_new, initial_state = ctx.saved_tensors
-        BT = ctx.BT
-        w, u = fwd_recompute_w_u(k, v, beta, A_w, A_u, BT)
-        # checkpont_level=1, recomputation.
-        # we need fp32 state to compute gradient.
-        if h is None:
-            h, v_new = chunk_fwd_h_fn(k, w, u, g, BT, initial_state, None, state_in_fp32=True)
-        du = fwd_prepare_du(q, k, g, do, BT)
-        dh, du = chunk_bwd_dhu_fn(q, k, w, g, do, du, BT)
-        dq, dk, dw, dg = chunk_bwd_dqkw_fn(q, k, v_new, w, g, h, du, do, dh, BT)
-        dk2, dv, dbeta, dg2 = bwd_prepare_wy_repr(k, v, beta, g, A_w, A_u, A_w_original, A_u_original, dw, du, BT)
-        dk.add_(dk2)
-        dg.add_(dg2)
-
-        dg = rearrange(dg, 'b h (n c) -> b h n c', c=BT)
-        # mask = (torch.arange(0, BT)[:, None] >= torch.arange(0, BT)[None, :]).to(dg)
-        assert dg.dtype == torch.float32, "dg should be fp32"
-        # print(dg.abs().max())
-        # dg = dg @ mask
-        # dg = dg * 1.44269504
-        def rev_cumsum(x):
-            cumsum_x = x.cumsum(-1)
-            rev_cumsum_x = cumsum_x[..., -1, None] - cumsum_x
-            return rev_cumsum_x + x
-
-        dg = rev_cumsum(dg)
-        dg = rearrange(dg, 'b h n c -> b h (n c)')
-        # print(dg.abs().max(), dq.abs().max(), dk.abs().max(), dv.abs().max(), dbeta.abs().max())
-        # if dg.isnan().any():
-        # breakpoint()
-
-        return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), dbeta.to(beta.dtype), dg.to(g.dtype), None, None, None, None
+@pytest.mark.parametrize('Z, H, N_CTX, D_HEAD', [(6, 9, 1024, 64)])
+@pytest.mark.parametrize('causal', [False, True])
+def test_op(Z, H, N_CTX, D_HEAD, causal, dtype=torch.float16):
+    torch.manual_seed(20)
+    q = torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0., std=0.5).requires_grad_()
+    k = torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0., std=0.5).requires_grad_()
+    v = torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0., std=0.5).requires_grad_()
+    sm_scale = 0.5
+    dout = torch.randn_like(q)
+    # reference implementation
+    M = torch.tril(torch.ones((N_CTX, N_CTX), device="cuda"))
+    p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
+    if causal:
+        p[:, :, M == 0] = float("-inf")
+    p = torch.softmax(p.float(), dim=-1).half()
+    # p = torch.exp(p)
+    ref_out = torch.matmul(p, v)
+    ref_out.backward(dout)
+    ref_dv, v.grad = v.grad.clone(), None
+    ref_dk, k.grad = k.grad.clone(), None
+    ref_dq, q.grad = q.grad.clone(), None
+    # triton implementation
+    tri_out = attention(q, k, v, causal, sm_scale).half()
+    tri_out.backward(dout)
+    tri_dv, v.grad = v.grad.clone(), None
+    tri_dk, k.grad = k.grad.clone(), None
+    tri_dq, q.grad = q.grad.clone(), None
+    # compare
+    assert torch.allclose(ref_out, tri_out, atol=1e-2, rtol=0)
+    assert torch.allclose(ref_dv, tri_dv, atol=1e-2, rtol=0)
+    assert torch.allclose(ref_dk, tri_dk, atol=1e-2, rtol=0)
+    assert torch.allclose(ref_dq, tri_dq, atol=1e-2, rtol=0)
 
 
+try:
+    from flash_attn.flash_attn_interface import flash_attn_qkvpacked_func as flash_attn_func
+    FLASH_VER = 2
+except BaseException:
+    try:
+        from flash_attn.flash_attn_interface import flash_attn_func
+        FLASH_VER = 1
+    except BaseException:
+        FLASH_VER = None
+HAS_FLASH = FLASH_VER is not None
 
-def chunk_gated_delta_rule(
-    q: torch.Tensor,
+BATCH, N_HEADS, N_CTX, D_HEAD = 4, 48, 4096, 64
+# vary seq length for fixed head and batch=4
+configs = [triton.testing.Benchmark(
+    x_names=['N_CTX'],
+    x_vals=[2**i for i in range(10, 15)],
+    line_arg='provider',
+    line_vals=['triton'] + (['flash'] if HAS_FLASH else []),
+    line_names=['Triton'] + ([f'Flash-{FLASH_VER}'] if HAS_FLASH else []),
+    styles=[('red', '-'), ('blue', '-')],
+    ylabel='ms',
+    plot_name=f'fused-attention-batch{BATCH}-head{N_HEADS}-d{D_HEAD}-{mode}',
+    args={'H': N_HEADS, 'BATCH': BATCH, 'D_HEAD': D_HEAD, 'dtype': torch.float16, 'mode': mode, 'causal': causal}
+) for mode in ['fwd', 'bwd'] for causal in [False, True]]
+
+
+@triton.testing.perf_report(configs)
+def bench_flash_attention(BATCH, H, N_CTX, D_HEAD, causal, mode, provider="triton", dtype=torch.float16, device="cuda"):
+    assert mode in ['fwd', 'bwd']
+    warmup = 25
+    rep = 100
+    if provider == "triton":
+        q = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
+        k = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
+        v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
+        sm_scale = 1.3
+        fn = lambda: attention(q, k, v, causal, sm_scale)
+        if mode == 'bwd':
+            o = fn()
+            do = torch.randn_like(o)
+            fn = lambda: o.backward(do, retain_graph=True)
+        ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+    if provider == "flash":
+        qkv = torch.randn((BATCH, N_CTX, 3, H, D_HEAD), dtype=dtype, device=device, requires_grad=True)
+        if FLASH_VER == 1:
+            lengths = torch.full((BATCH,), fill_value=N_CTX, device=device)
+            cu_seqlens = torch.zeros((BATCH + 1,), device=device, dtype=torch.int32)
+            cu_seqlens[1:] = lengths.cumsum(0)
+            qkv = qkv.reshape(BATCH * N_CTX, 3, H, D_HEAD)
+            fn = lambda: flash_attn_func(qkv, cu_seqlens, 0., N_CTX, causal=causal)
+        elif FLASH_VER == 2:
+            fn = lambda: flash_attn_func(qkv, causal=causal)
+        else:
+            raise ValueError(f'unknown {FLASH_VER = }')
+        if mode == 'bwd':
+            o = fn()
+            do = torch.randn_like(o)
+            fn = lambda: o.backward(do, retain_graph=True)
+        ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+    flops_per_matmul = 2. * BATCH * H * N_CTX * N_CTX * D_HEAD
+    total_flops = 2 * flops_per_matmul
+    if causal:
+        total_flops *= 0.5
+    if mode == 'bwd':
+        total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
+    return total_flops / ms * 1e-9
+
+
+# only works on post-Ampere GPUs right now
+# bench_flash_attention.run(save_path='.', print_data=True)
+
+@torch.compile
+def ssa_ref(
+    q1: torch.Tensor,
+    q2: torch.Tensor,
     k: torch.Tensor,
-    v: torch.Tensor,
-    beta: torch.Tensor,
-    g: torch.Tensor,
-    BT: int = 64, #chunk size
-    initial_state: torch.Tensor = None,
-    output_final_state: bool = False
+    v1: torch.Tensor,
+    v2: torch.Tensor,
 ):
-    assert q.dtype == k.dtype == v.dtype
-    L = q.shape[-2]
-    if L % BT != 0:
-        q, k, v, beta, g = map(lambda x: F.pad(x, (0, 0, 0, BT - L % BT)), [q, k, v, beta.unsqueeze(-1), g.unsqueeze(-1)])
-    g = g.squeeze(-1)
-    beta = beta.squeeze(-1)
-
-    if initial_state is not None:
-        initial_state = initial_state.detach()
-    o, final_state = ChunkGatedDeltaRuleFunction.apply(q, k, v, beta, g, BT,  initial_state, output_final_state)
-    return o[:, :, :L, :], final_state
-
-def recurrent_ssa_ref(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    beta: torch.Tensor,
-    g: torch.Tensor,
-):
-  q, k, v, beta, g = map(lambda x: x.to(torch.float32), [q, k, v, beta, g])
-  b, h, l, d_k = q.shape
-  d_v = v.shape[-1]
-  o = torch.zeros_like(v)
-  S = torch.zeros(b, h, d_k, d_v).to(v)
-  q = q * (d_k ** -0.5)
-  for i in range(l):
-      _k = k[:, :, i]
-      _q = q[:, :, i:i+1]
-      _v = v[:, :, i].clone()
-      S = S.clone() * g[:, :, i].exp()[..., None, None]
-      beta_i = beta[:, :, i]
-      _v = _v - (S.clone() * _k[..., None]).sum(-2)
-      _v = _v * beta_i[..., None]
-      S = S.clone() + _k.unsqueeze(-1) * _v.unsqueeze(-2)
-      o[:, :, i:i+1] = F.scaled_dot_product_attention(_q, k[:, :, :i+1], k[:, :, :i+1] @ S)
+  q1, q2, k, v1, v2 = map(lambda x: x.to(torch.float32), [q1, q2, k, v1, v2])
+  b, h, l, d_k = q1.shape
+  d_v1 = v1.shape[-1]
+  d_v2 = v2.shape[-2]
+  S = torch.cumsum(v1.unsqueeze(-1) @ v2.unsqueeze(-2), dim = 3)
+  q1 = q1 * (d_k ** -0.5)
+  q2 = q2 * (d_k ** -0.5)
+  mask = torch.tril(torch.ones((l, l), dtype=torch.bool, device=q1.device)).unsqueeze(0).unsqueeze(0)
+  attn_scores = torch.matmul(q1, k.transpose(-2, -1))
+  attn_scores = attn_scores.masked_fill(mask == 0, float('-inf'))
+  attn_scores = F.softmax(attn_scores - attn_scores.amax(-1, keepdim = True), dim=-1)
+  S_ = torch.einsum("bhst,bhtmn->bhsmn", attn_scores, S)
+  o = torch.einsum("bhsm,bhsmn->bhsn", q2, S_)
   return o
-
 
 if __name__ == '__main__':
     B = 4
@@ -749,16 +456,16 @@ if __name__ == '__main__':
     DV = 64
     require_grad = True
     dtype = torch.bfloat16
-    q = (torch.rand(B, H, L, DK)).cuda().to(dtype)
+    q1 = (torch.rand(B, H, L, DK)).cuda().to(dtype)
+    q2 = (torch.rand(B, H, L, DV)).cuda().to(dtype)
     k = (torch.randn(B, H, L, DK)).cuda()
     k = torch.nn.functional.normalize(k, dim=-1, p=2).to(dtype)
-    v = (torch.randn(B, H, L, DV)).cuda().to(dtype)
-    beta = torch.randn(B, H, L).sigmoid().cuda()
-    decay = torch.empty(B, H, L).uniform_(0.01, 0.03).log().cuda()
-    q,k,v,beta,decay = map(lambda x: x.requires_grad_(require_grad), [q,k,v,beta,decay])
+    v1 = (torch.randn(B, H, L, DV)).cuda().to(dtype)
+    v2 = (torch.rand(B, H, L, DV)).cuda().to(dtype)
+    q1, q2, k, v1, v2 = map(lambda x: x.requires_grad_(require_grad), [q1, q2, k, v1, v2])
 
     # o, _,  = chunk_gated_delta_rule(q, k, v, beta, decay, BT=64)
-    o2 = recurrent_ssa_ref(q, k, v, beta, decay)
+    o2 = ssa_ref(q1, q2, k, v1, v2)
     do2 = torch.randn_like(o2)
     o2.backward(do2)
     breakpoint()
