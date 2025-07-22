@@ -1,4 +1,3 @@
-import math
 import pytest
 import torch
 
@@ -116,7 +115,6 @@ def _fwd_kernel(
     q1 = tl.load(Q1_block_ptr)
     q1 = (q1 * qk_scale).to(tl.float16)
     q2 = tl.load(Q2_block_ptr)
-    q2 = (q2 * qk_scale).to(tl.float16)
     # loop over k, v and update accumulator
     lo = 0
     hi = (start_m + 1) * BLOCK_M if IS_CAUSAL else N_CTX
@@ -464,19 +462,18 @@ def ssa_ref(
     k: torch.Tensor,
     v1: torch.Tensor,
     v2: torch.Tensor,
+    sm_scale: float,
 ):
   q1, q2, k, v1, v2 = map(lambda x: x.to(torch.float32), [q1, q2, k, v1, v2])
   b, h, l, d_k = q1.shape
   d_v1 = v1.shape[-1]
   d_v2 = v2.shape[-2]
   S = torch.cumsum(v1.unsqueeze(-1) @ v2.unsqueeze(-2), dim = 3)
-  q1 = q1 * (d_k ** -0.5)
-  q2 = q2 * (d_k ** -0.5)
-  mask = torch.tril(torch.ones((l, l), dtype=torch.bool, device=q1.device)).unsqueeze(0).unsqueeze(0)
-  attn_scores = torch.matmul(q1, k.transpose(-2, -1))
-  attn_scores = attn_scores.masked_fill(mask == 0, float('-inf'))
-  attn_scores = F.softmax(attn_scores - attn_scores.amax(-1, keepdim = True), dim=-1)
-  S_ = torch.einsum("bhst,bhtmn->bhsmn", attn_scores, S)
+  M = torch.tril(torch.ones((l, l), device="cuda"))
+  p = torch.matmul(q1, k.transpose(2, 3)) * sm_scale
+  p[:, :, M == 0] = float("-inf")
+  p = torch.softmax(p.float(), dim=-1).half()
+  S_ = torch.einsum("bhst,bhtmn->bhsmn", p, S)
   o = torch.einsum("bhsm,bhsmn->bhsn", q2, S_)
   return o
 
@@ -493,13 +490,14 @@ if __name__ == '__main__':
     k = (torch.randn(B, H, L, DK)).cuda()
     k = torch.nn.functional.normalize(k, dim=-1, p=2).to(dtype)
     v1 = (torch.randn(B, H, L, DV)).cuda().to(dtype)
-    v2 = (torch.rand(B, H, L, DV)).cuda().to(dtype)
+    v2 = (torch.randn(B, H, L, DV)).cuda().to(dtype)
     q1, q2, k, v1, v2 = map(lambda x: x.requires_grad_(require_grad), [q1, q2, k, v1, v2])
 
-    o  = attention(q1, q2, k, v1, v2, True, 1/math.sqrt(DK))
-    o2 = ssa_ref(q1, q2, k, v1, v2)
+    o  = attention(q1, q2, k, v1, v2, True, (DK**(-0.5)))
+    o2 = ssa_ref(q1, q2, k, v1, v2, (DK**(-0.5)))
     do2 = torch.randn_like(o2)
-    print(torch.norm(o - o2), torch.mean(o - o2))
+    diff = o - o2
+    print(torch.norm(diff), torch.mean(diff), torch.max(diff), torch.min(diff))
     # o2.backward(do2)
     # breakpoint()
     # q_grad, q.grad = q.grad, None 
