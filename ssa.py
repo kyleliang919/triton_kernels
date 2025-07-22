@@ -1,3 +1,4 @@
+import math
 import pytest
 import torch
 
@@ -42,12 +43,14 @@ def max_fn(x, y):
 
 @triton.jit
 def _fwd_kernel(
-    Q, K, V, sm_scale,
+    Q1, Q2, K, V1, V2, sm_scale,
     L,
     Out,
-    stride_qz, stride_qh, stride_qm, stride_qk,
+    stride_q1z, stride_q1h, stride_q1m, stride_q1k,
+    stride_q2z, stride_q2h, stride_q2m, stride_q2k,
     stride_kz, stride_kh, stride_kn, stride_kk,
-    stride_vz, stride_vh, stride_vk, stride_vn,
+    stride_v1z, stride_v1h, stride_v1k, stride_v1n,
+    stride_v2z, stride_v2h, stride_v2k, stride_v2n,
     stride_oz, stride_oh, stride_om, stride_on,
     Z, H, N_CTX,
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
@@ -56,11 +59,19 @@ def _fwd_kernel(
 ):
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
-    qvk_offset = off_hz * stride_qh
-    Q_block_ptr = tl.make_block_ptr(
-        base=Q + qvk_offset,
+    qvk_offset = off_hz * stride_q1h
+    Q1_block_ptr = tl.make_block_ptr(
+        base=Q1 + qvk_offset,
         shape=(N_CTX, BLOCK_DMODEL),
-        strides=(stride_qm, stride_qk),
+        strides=(stride_q1m, stride_q1k),
+        offsets=(start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, BLOCK_DMODEL),
+        order=(1, 0)
+    )
+    Q2_block_ptr = tl.make_block_ptr(
+        base=Q2 + qvk_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_q2m, stride_q2k),
         offsets=(start_m * BLOCK_M, 0),
         block_shape=(BLOCK_M, BLOCK_DMODEL),
         order=(1, 0)
@@ -73,10 +84,18 @@ def _fwd_kernel(
         block_shape=(BLOCK_DMODEL, BLOCK_N),
         order=(0, 1)
     )
-    V_block_ptr = tl.make_block_ptr(
-        base=V + qvk_offset,
+    V1_block_ptr = tl.make_block_ptr(
+        base=V1 + qvk_offset,
         shape=(N_CTX, BLOCK_DMODEL),
-        strides=(stride_vk, stride_vn),
+        strides=(stride_v1k, stride_v1n),
+        offsets=(0, 0),
+        block_shape=(BLOCK_N, BLOCK_DMODEL),
+        order=(1, 0)
+    )
+    V2_block_ptr = tl.make_block_ptr(
+        base=V2 + qvk_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_v2k, stride_v2n),
         offsets=(0, 0),
         block_shape=(BLOCK_N, BLOCK_DMODEL),
         order=(1, 0)
@@ -88,39 +107,50 @@ def _fwd_kernel(
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+    S = tl.zeros([1, BLOCK_DMODEL, BLOCK_DMODEL], dtype=tl.float32)
     # scale sm_scale by log_2(e) and use
     # 2^x instead of exp in the loop because CSE and LICM
     # don't work as expected with `exp` in the loop
     qk_scale = sm_scale * 1.44269504
     # load q: it will stay in SRAM throughout
-    q = tl.load(Q_block_ptr)
-    q = (q * qk_scale).to(tl.float16)
+    q1 = tl.load(Q1_block_ptr)
+    q1 = (q1 * qk_scale).to(tl.float16)
+    q2 = tl.load(Q2_block_ptr)
+    q2 = (q2 * qk_scale).to(tl.float16)
     # loop over k, v and update accumulator
     lo = 0
     hi = (start_m + 1) * BLOCK_M if IS_CAUSAL else N_CTX
     for start_n in range(lo, hi, BLOCK_N):
         # -- load k, v --
         k = tl.load(K_block_ptr)
-        v = tl.load(V_block_ptr)
+        v1 = tl.load(V1_block_ptr)
+        v2 = tl.load(V2_block_ptr)
         # -- compute qk ---
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         if IS_CAUSAL:
             qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
-        qk += tl.dot(q, k)
+        qk += tl.dot(q1, k)
         # -- compute scaling constant ---
         m_i_new = tl.maximum(m_i, tl.max(qk, 1))
         alpha = tl.math.exp2(m_i - m_i_new)
         p = tl.math.exp2(qk - m_i_new[:, None])
         # -- scale and update acc --
         acc_scale = l_i * 0 + alpha  # workaround some compiler bug
-        acc *= acc_scale[:, None]
-        acc += tl.dot(p.to(tl.float16), v)
+
+        S_ = v1[:, :, None] * v2[:, None, :]
+        S_ = tl.sum(p.to(tl.float16)[:, :, None, None] *  S_[None, :, :, :], axis = 1)
+        S_update = tl.sum(S_, axis = 0, keep_dims = True)
+        S *= acc_scale[:, None]
+        S_ = tl.cumsum(S_ + S, axis = 0)
+        S += S_update
+        acc += tl.sum(q2[:, :, None] * S_, axis = 1)
         # -- update m_i and l_i --
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_i_new
         # update pointers
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+        V1_block_ptr = tl.advance(V1_block_ptr, (BLOCK_N, 0))
+        V2_block_ptr = tl.advance(V2_block_ptr, (BLOCK_N, 0))
     # write back l and m
     acc = acc / l_i[:, None]
     l_ptrs = L + off_hz * N_CTX + offs_m
@@ -252,33 +282,35 @@ empty = torch.empty(128, device="cuda")
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, g, beta, causal, sm_scale):
+    def forward(ctx, q1, q2, k, v1, v2, causal, sm_scale):
         # shape constraints
-        Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
-        assert Lq == Lk and Lk == Lv
+        Lq1, Lq2, Lk, Lv1, Lv2 = q1.shape[-1], q2.shape[-1], k.shape[-1], v1.shape[-1], v2.shape[-1]
+        assert Lq1 == Lk and Lq2 == Lv1
         assert Lk in {16, 32, 64, 128}
-        o = torch.empty_like(q)
-        BLOCK_M = 128
-        BLOCK_N = 64
-        grid = (triton.cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
-        L = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+        o = torch.empty_like(q1)
+        BLOCK_M = 16
+        BLOCK_N = 16
+        grid = (triton.cdiv(q1.shape[2], BLOCK_M), q1.shape[0] * q1.shape[1], 1)
+        L = torch.empty((q1.shape[0] * q1.shape[1], q1.shape[2]), device=q1.device, dtype=torch.float32)
 
         num_warps = 4 if Lk <= 64 else 8
         _fwd_kernel[grid](
-            q, k, v, g, beta, sm_scale,
+            q1, q2, k, v1, v2, sm_scale,
             L,
             o,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            q1.stride(0), q1.stride(1), q1.stride(2), q1.stride(3),
+            q2.stride(0), q2.stride(1), q2.stride(2), q2.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            v1.stride(0), v1.stride(1), v1.stride(2), v1.stride(3),
+            v2.stride(0), v2.stride(1), v2.stride(2), v2.stride(3),
             o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            q.shape[0], q.shape[1], q.shape[2],
+            q1.shape[0], q1.shape[1], q1.shape[2],
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=Lk,
             IS_CAUSAL=causal,
             num_warps=num_warps,
             num_stages=4)
 
-        ctx.save_for_backward(q, k, v, o, L)
+        ctx.save_for_backward(q1, q2, k, v1, v2, o, L)
         ctx.grid = grid
         ctx.sm_scale = sm_scale
         ctx.BLOCK_DMODEL = Lk
@@ -452,10 +484,10 @@ if __name__ == '__main__':
     B = 4
     H = 2
     L = 1024
-    DK = 128
-    DV = 64
+    DK = 16
+    DV = 16
     require_grad = True
-    dtype = torch.bfloat16
+    dtype = torch.float16
     q1 = (torch.rand(B, H, L, DK)).cuda().to(dtype)
     q2 = (torch.rand(B, H, L, DV)).cuda().to(dtype)
     k = (torch.randn(B, H, L, DK)).cuda()
@@ -464,11 +496,12 @@ if __name__ == '__main__':
     v2 = (torch.rand(B, H, L, DV)).cuda().to(dtype)
     q1, q2, k, v1, v2 = map(lambda x: x.requires_grad_(require_grad), [q1, q2, k, v1, v2])
 
-    # o, _,  = chunk_gated_delta_rule(q, k, v, beta, decay, BT=64)
+    o  = attention(q1, q2, k, v1, v2, True, 1/math.sqrt(DK))
     o2 = ssa_ref(q1, q2, k, v1, v2)
     do2 = torch.randn_like(o2)
-    o2.backward(do2)
-    breakpoint()
+    print(torch.norm(o - o2), torch.mean(o - o2))
+    # o2.backward(do2)
+    # breakpoint()
     # q_grad, q.grad = q.grad, None 
     # k_grad, k.grad = k.grad, None
     # v_grad, v.grad = v.grad, None
