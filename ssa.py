@@ -106,7 +106,6 @@ def _fwd_kernel(
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
-    S = tl.zeros([1, BLOCK_DMODEL, BLOCK_DMODEL], dtype=tl.float32)
     # scale sm_scale by log_2(e) and use
     # 2^x instead of exp in the loop because CSE and LICM
     # don't work as expected with `exp` in the loop
@@ -134,13 +133,9 @@ def _fwd_kernel(
         p = tl.math.exp2(qk - m_i_new[:, None])
         # -- scale and update acc --
         acc_scale = l_i * 0 + alpha  # workaround some compiler bug
-
         S_ = v1[:, :, None] * v2[:, None, :]
         S_ = tl.sum(p.to(tl.float16)[:, :, None, None] *  S_[None, :, :, :], axis = 1)
-        S_update = tl.sum(S_, axis = 0, keep_dims = True)
-        S *= acc_scale[:, None]
-        S_ = tl.cumsum(S_ + S, axis = 0)
-        S += S_update
+        acc *= acc_scale[:, None]
         acc += tl.sum(q2[:, :, None] * S_, axis = 1)
         # -- update m_i and l_i --
         l_i = l_i * alpha + tl.sum(p, 1)
@@ -455,7 +450,7 @@ def bench_flash_attention(BATCH, H, N_CTX, D_HEAD, causal, mode, provider="trito
 # only works on post-Ampere GPUs right now
 # bench_flash_attention.run(save_path='.', print_data=True)
 
-@torch.compile
+# @torch.compile
 def ssa_ref(
     q1: torch.Tensor,
     q2: torch.Tensor,
@@ -467,22 +462,25 @@ def ssa_ref(
   q1, q2, k, v1, v2 = map(lambda x: x.to(torch.float32), [q1, q2, k, v1, v2])
   b, h, l, d_k = q1.shape
   d_v1 = v1.shape[-1]
-  d_v2 = v2.shape[-2]
-  S = torch.cumsum(v1.unsqueeze(-1) @ v2.unsqueeze(-2), dim = 3)
+  d_v2 = v2.shape[-1]
+  S = v1.unsqueeze(-1) @ v2.unsqueeze(-2)
   M = torch.tril(torch.ones((l, l), device="cuda"))
   p = torch.matmul(q1, k.transpose(2, 3)) * sm_scale
   p[:, :, M == 0] = float("-inf")
   p = torch.softmax(p.float(), dim=-1).half()
-  S_ = torch.einsum("bhst,bhtmn->bhsmn", p, S)
+  # S_ = torch.einsum("bhst,bhtd->bhsd", p.float(), S.flatten(start_dim = -2).float()).reshape(b, h, l, d_v1, d_v2)
+  # S_ = (p.float()[:, :, :, :, None, None] * S.float()[:, :, None, :, :, :]).sum(3)
+  S_ = torch.einsum("bhst,bhtmn->bhsmn", p.float(), S.float())
   o = torch.einsum("bhsm,bhsmn->bhsn", q2, S_)
+  # o = (q2[:, :, :, :, None] * S_).sum(-2)
   return o
 
 if __name__ == '__main__':
     B = 4
     H = 2
     L = 1024
-    DK = 16
-    DV = 16
+    DK = 32
+    DV = 32
     require_grad = True
     dtype = torch.float16
     q1 = (torch.rand(B, H, L, DK)).cuda().to(dtype)
@@ -499,7 +497,6 @@ if __name__ == '__main__':
     diff = o - o2
     print(torch.norm(diff), torch.mean(diff), torch.max(diff), torch.min(diff))
     # o2.backward(do2)
-    # breakpoint()
     # q_grad, q.grad = q.grad, None 
     # k_grad, k.grad = k.grad, None
     # v_grad, v.grad = v.grad, None
