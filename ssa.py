@@ -179,13 +179,15 @@ def _bwd_preprocess(
 
 @triton.jit
 def _bwd_kernel(
-    Q, K, V, sm_scale, Out, DO,
-    DQ, DK, DV,
+    Q1, Q2, K, V1, V2, sm_scale, Out, DO,
+    DQ1, DQ2, DK, DV1, DV2,
     L,
     D,
-    stride_qz, stride_qh, stride_qm, stride_qk,
+    stride_q1z, stride_q1h, stride_q1m, stride_q1k,
+    stride_q2z, stride_q2h, stride_q2m, stride_q2k,
     stride_kz, stride_kh, stride_kn, stride_kk,
-    stride_vz, stride_vh, stride_vk, stride_vn,
+    stride_v1z, stride_v1h, stride_v1k, stride_v1n,
+    stride_v2z, stride_v2h, stride_v2k, stride_v2n,
     Z, H, N_CTX,
     num_block,
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
@@ -197,8 +199,10 @@ def _bwd_kernel(
     off_h = off_hz % H
     qk_scale = sm_scale * 1.44269504
     # offset pointers for batch/head
-    Q += off_z * stride_qz + off_h * stride_qh
+    Q1 += off_z * stride_q1z + off_h * stride_q1h
+    Q2 += off_z * stride_q2z + off_h * stride_q2h
     K += off_z * stride_qz + off_h * stride_qh
+    V += off_z * stride_qz + off_h * stride_qh
     V += off_z * stride_qz + off_h * stride_qh
     DO += off_z * stride_qz + off_h * stride_qh
     DQ += off_z * stride_qz + off_h * stride_qh
@@ -313,11 +317,13 @@ class _attention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         BLOCK = 128
-        q, k, v, o, L = ctx.saved_tensors
+        q1, q2, k, v1, v2, o, L = ctx.saved_tensors
         do = do.contiguous()
-        dq = torch.zeros_like(q, dtype=torch.float32)
+        dq1 = torch.zeros_like(q1, dtype=torch.float32)
+        dq2 = torch.zeros_like(q2, dtype=torch.float32)
         dk = torch.empty_like(k)
-        dv = torch.empty_like(v)
+        dv1 = torch.empty_like(v1)
+        dv2 = torch.empty_like(v2)
         delta = torch.empty_like(L)
         _bwd_preprocess[(ctx.grid[0] * ctx.grid[1], )](
             o, do,
@@ -325,21 +331,23 @@ class _attention(torch.autograd.Function):
             BLOCK_M=BLOCK, D_HEAD=ctx.BLOCK_DMODEL,
         )
         _bwd_kernel[(ctx.grid[1],)](
-            q, k, v, ctx.sm_scale,
+            q1, q2, k, v1, v2, ctx.sm_scale,
             o, do,
-            dq, dk, dv,
+            dq1, dq2, dk, dv1, dv2,
             L, delta,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            q1.stride(0), q1.stride(1), q1.stride(2), q1.stride(3),
+            q2.stride(0), q2.stride(1), q2.stride(2), q2.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            q.shape[0], q.shape[1], q.shape[2],
+            v1.stride(0), v1.stride(1), v1.stride(2), v1.stride(3),
+            v2.stride(0), v2.stride(1), v2.stride(2), v2.stride(3),
+            q1.shape[0], q1.shape[1], q1.shape[2],
             ctx.grid[0],
             BLOCK_M=BLOCK, BLOCK_N=BLOCK,
             BLOCK_DMODEL=ctx.BLOCK_DMODEL, num_warps=8,
             CAUSAL=ctx.causal,
             num_stages=1,
         )
-        return dq, dk, dv, None, None
+        return dq1, dq2, dk, dv1, dv2, None, None
 
 
 attention = _attention.apply
@@ -495,17 +503,17 @@ if __name__ == '__main__':
     o2 = ssa_ref(q1, q2, k, v1, v2, (DK**(-0.5)))
     do2 = torch.randn_like(o2)
     diff = o - o2
-    print(torch.norm(diff), torch.mean(diff), torch.max(diff), torch.min(diff))
-    # o2.backward(do2)
-    # q_grad, q.grad = q.grad, None 
-    # k_grad, k.grad = k.grad, None
-    # v_grad, v.grad = v.grad, None
-    # beta_grad, beta.grad = beta.grad, None
-    # decay_grad, decay.grad = decay.grad, None
-    # o.backward(do2)
-    # print( (o - o2).abs().max())
-    # print( (q.grad - q_grad).abs().max())
-    # print( (k.grad - k_grad).abs().max())
-    # print( (v.grad - v_grad).abs().max())
-    # print( (beta.grad - beta_grad).abs().max())
-    # print( (decay.grad - decay_grad).abs().max())
+    print(torch.max(diff.abs()))
+    o2.backward(do2)
+    q1_grad, q1.grad = q1.grad, None
+    q2_grad, q2.grad = q2.grad, None  
+    k_grad, k.grad = k.grad, None
+    v1_grad, v1.grad = v1.grad, None
+    v2_grad, v2.grad = v2.grad, None
+    o.backward(do2)
+    print( (o - o2).abs().max())
+    print( (q1.grad - q1_grad).abs().max())
+    print( (q2.grad - q2_grad).abs().max())
+    print( (k.grad - k_grad).abs().max())
+    print( (v1.grad - v1_grad).abs().max())
+    print( (v2.grad - v2_grad).abs().max())
