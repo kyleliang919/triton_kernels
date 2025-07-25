@@ -201,13 +201,15 @@ def _bwd_kernel(
     # offset pointers for batch/head
     Q1 += off_z * stride_q1z + off_h * stride_q1h
     Q2 += off_z * stride_q2z + off_h * stride_q2h
-    K += off_z * stride_qz + off_h * stride_qh
-    V += off_z * stride_qz + off_h * stride_qh
-    V += off_z * stride_qz + off_h * stride_qh
-    DO += off_z * stride_qz + off_h * stride_qh
-    DQ += off_z * stride_qz + off_h * stride_qh
-    DK += off_z * stride_qz + off_h * stride_qh
-    DV += off_z * stride_qz + off_h * stride_qh
+    K += off_z * stride_q1z + off_h * stride_q1h
+    V1 += off_z * stride_q1z + off_h * stride_q1h
+    V2 += off_z * stride_q2z + off_h * stride_q2h
+    DO += off_z * stride_q2z + off_h * stride_q2h
+    DQ1 += off_z * stride_q1z + off_h * stride_q1h
+    DQ2 += off_z * stride_q2z + off_h * stride_q2h
+    DK += off_z * stride_q1z + off_h * stride_q1h
+    DV1 += off_z * stride_q1z + off_h * stride_q1h
+    DV2 += off_z * stride_q2z + off_h * stride_q2h
     for start_n in range(0, num_block):
         if CAUSAL:
             lo = start_n * BLOCK_M
@@ -219,25 +221,29 @@ def _bwd_kernel(
         offs_m = tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_DMODEL)
         # initialize pointers to value-like data
-        q_ptrs = Q + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        q1_ptrs = Q1 + (offs_qm[:, None] * stride_q1m + offs_k[None, :] * stride_q1k)
+        q2_ptrs = Q2 + (offs_qm[:, None] * stride_q2m + offs_k[None, :] * stride_q2k)
         k_ptrs = K + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
-        v_ptrs = V + (offs_n[:, None] * stride_qm + offs_k[None, :] * stride_qk)
-        do_ptrs = DO + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
-        dq_ptrs = DQ + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        v1_ptrs = V1 + (offs_n[:, None] * stride_q1m + offs_k[None, :] * stride_q1k)
+        v2_ptrs = V2 + (offs_n[:, None] * stride_q2m + offs_k[None, :] * stride_q2k)
+        do_ptrs = DO + (offs_qm[:, None] * stride_q2m + offs_k[None, :] * stride_q2k)
+        dq_ptrs = DQ + (offs_qm[:, None] * stride_q2m + offs_k[None, :] * stride_q2k)
         # pointer to row-wise quantities in value-like data
         D_ptrs = D + off_hz * N_CTX
         l_ptrs = L + off_hz * N_CTX
         # initialize dv amd dk
-        dv = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+        dv1 = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+        dv2 = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
         dk = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
         # k and v stay in SRAM throughout
         k = tl.load(k_ptrs)
-        v = tl.load(v_ptrs)
+        v1 = tl.load(v1_ptrs)
+        v2 = tl.load(v2_ptrs)
         # loop over rows
         for start_m in range(lo, num_block * BLOCK_M, BLOCK_M):
             offs_m_curr = start_m + offs_m
             # load q, k, v, do on-chip
-            q = tl.load(q_ptrs)
+            q1 = tl.load(q1_ptrs)
             # recompute p = softmax(qk, dim=-1).T
             if CAUSAL:
                 qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), float(0.), float("-inf"))
