@@ -256,18 +256,19 @@ def _bwd_kernel(
             l_i = tl.load(l_ptrs + offs_m_curr)
             p = tl.math.exp2(qk - l_i[:, None])
             v1v2 = v1[:, :, None] * v2[:, None, :]
-            # compute dq2
-            dq2 = tl.load(dq2_ptrs)
-            pv1v2 = tl.sum(p.to(tl.float16)[:, :, None, None] * v1v2[None, :, :, :], axis = 1)
-            dq2 += tl.sum(do[:, :, None] * pv1v2, axis = 2)
-            tl.store(dq2_ptrs, dq2)
-
+            
             # compute dv
             do = tl.load(do_ptrs)
             dpv1v2 = do[:, None, :] * q2[:, :, None]
             dv1v2 = tl.sum(p.to(tl.float16)[:, :, None, None] * dpv1v2[:, None, :, :], axis = 0)
             dv1 += tl.sum(dv1v2 * v2[:, None, :], axis = 2)
             dv2 += tl.sum(dv1v2 * v1[:, :, None], axis = 1)
+
+            # compute dq2
+            dq2 = tl.load(dq2_ptrs)
+            pv1v2 = tl.sum(p.to(tl.float16)[:, :, None, None] * v1v2[None, :, :, :], axis = 1)
+            dq2 += tl.sum(do[:, :, None] * pv1v2, axis = 2)
+            tl.store(dq2_ptrs, dq2)
 
             # p -> [TxT]
             # v1 -> [T x d]
