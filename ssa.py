@@ -255,6 +255,7 @@ def _bwd_kernel(
             qk *= qk_scale
             l_i = tl.load(l_ptrs + offs_m_curr)
             p = tl.math.exp2(qk - l_i[:, None])
+            # prepare value for backward pass
             v1v2 = v1[:, :, None] * v2[:, None, :]
             
             # compute dv
@@ -267,7 +268,7 @@ def _bwd_kernel(
             # compute dq2
             dq2 = tl.load(dq2_ptrs)
             pv1v2 = tl.sum(p.to(tl.float16)[:, :, None, None] * v1v2[None, :, :, :], axis = 1)
-            dq2 += tl.sum(do[:, None, :] * pv1v2, axis = 1)
+            dq2 += tl.sum(do[:, None, :] * pv1v2, axis = 2)
             tl.store(dq2_ptrs, dq2)
 
             # p -> [TxT]
