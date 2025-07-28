@@ -355,7 +355,7 @@ class _attention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
-        BLOCK = 64
+        BLOCK = 16
         q1, q2, k, v1, v2, o, L = ctx.saved_tensors
         do = do.contiguous()
         dq1 = torch.zeros_like(q1, dtype=torch.float32)
