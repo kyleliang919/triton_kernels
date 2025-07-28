@@ -267,7 +267,7 @@ def _bwd_kernel(
             # compute dq2
             dq2 = tl.load(dq2_ptrs)
             pv1v2 = tl.sum(p.to(tl.float16)[:, :, None, None] * v1v2[None, :, :, :], axis = 1)
-            dq2 += tl.sum(do[:, :, None] * pv1v2, axis = 2)
+            dq2 += tl.sum(do[:, :, None] * pv1v2, axis = 1)
             tl.store(dq2_ptrs, dq2)
 
             # p -> [TxT]
@@ -542,8 +542,6 @@ if __name__ == '__main__':
     o  = attention(q1, q2, k, v1, v2, True, (DK**(-0.5)))
     o2 = ssa_ref(q1, q2, k, v1, v2, (DK**(-0.5)))
     do2 = torch.randn_like(o2)
-    diff = o - o2
-    print(torch.max(diff.abs()))
     o2.backward(do2)
     q1_grad, q1.grad = q1.grad, None
     q2_grad, q2.grad = q2.grad, None  
