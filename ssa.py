@@ -267,7 +267,7 @@ def _bwd_kernel(
             # compute dq2
             dq2 = tl.load(dq2_ptrs)
             pv1v2 = tl.sum(p.to(tl.float16)[:, :, None, None] * v1v2[None, :, :, :], axis = 1)
-            dq2 += tl.sum(do[:, :, None] * pv1v2, axis = 1)
+            dq2 += tl.sum(do[:, None, :] * pv1v2, axis = 1)
             tl.store(dq2_ptrs, dq2)
 
             # p -> [TxT]
