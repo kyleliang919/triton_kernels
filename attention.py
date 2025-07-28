@@ -126,8 +126,8 @@ def _bwd_preprocess(
 
 @triton.jit
 def _bwd_kernel(
-    Q, K, V, sm_scale, Out, DO,
-    DQ, DK, DV,
+    Q1, Q2, K, V1, V2, sm_scale, Out, DO,
+    DQ1, DQ2, DK, DV1, DV2,
     L,
     D,
     stride_qz, stride_qh, stride_qm, stride_qk,
@@ -200,7 +200,7 @@ def _bwd_kernel(
             # compute ds = p * (dp - delta[:, None])
             ds = p * dp * sm_scale
             # compute dk = dot(ds.T, q)
-            dk += tl.dot(tl.trans(ds.to(Q.dtype.element_ty)), q)
+            dk += tl.dot(tl.trans(ds.to(Q1.dtype.element_ty)), q)
             # compute dq
             dq = tl.load(dq_ptrs)
             dq += tl.dot(ds.to(Q.dtype.element_ty), k)

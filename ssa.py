@@ -227,7 +227,8 @@ def _bwd_kernel(
         v1_ptrs = V1 + (offs_n[:, None] * stride_q1m + offs_k[None, :] * stride_q1k)
         v2_ptrs = V2 + (offs_n[:, None] * stride_q2m + offs_k[None, :] * stride_q2k)
         do_ptrs = DO + (offs_qm[:, None] * stride_q2m + offs_k[None, :] * stride_q2k)
-        dq_ptrs = DQ + (offs_qm[:, None] * stride_q2m + offs_k[None, :] * stride_q2k)
+        dq1_ptrs = DQ1 + (offs_qm[:, None] * stride_q1m + offs_k[None, :] * stride_q1k)
+        dq2_ptrs = DQ2 + (offs_qm[:, None] * stride_q2m + offs_k[None, :] * stride_q2k)
         # pointer to row-wise quantities in value-like data
         D_ptrs = D + off_hz * N_CTX
         l_ptrs = L + off_hz * N_CTX
@@ -244,38 +245,70 @@ def _bwd_kernel(
             offs_m_curr = start_m + offs_m
             # load q, k, v, do on-chip
             q1 = tl.load(q1_ptrs)
+            q2 = tl.load(q2_ptrs)
             # recompute p = softmax(qk, dim=-1).T
             if CAUSAL:
                 qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), float(0.), float("-inf"))
             else:
                 qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-            qk += tl.dot(q, tl.trans(k))
+            qk += tl.dot(q1, tl.trans(k))
             qk *= qk_scale
             l_i = tl.load(l_ptrs + offs_m_curr)
             p = tl.math.exp2(qk - l_i[:, None])
+            v1v2 = v1[:, :, None] * v2[:, None, :]
+            # compute dq2
+            dq2 = tl.load(dq2_ptrs)
+            pv1v2 = tl.sum(p.to(tl.float16)[:, :, None, None] * v1v2[None, :, :, :], axis = 1)
+            dq2 += tl.sum(do[:, :, None] * pv1v2, axis = 2)
+            tl.store(dq2_ptrs, dq2)
+
             # compute dv
             do = tl.load(do_ptrs)
-            dv += tl.dot(tl.trans(p.to(Q.dtype.element_ty)), do)
+            dpv1v2 = do[:, None, :] * q2[:, :, None]
+            dv1v2 = tl.sum(p.to(tl.float16)[:, :, None, None] * dpv1v2[:, None, :, :], axis = 0)
+            dv1 += tl.sum(dv1v2 * v2[:, None, :], axis = 2)
+            dv2 += tl.sum(dv1v2 * v1[:, :, None], axis = 1)
+            
+            # p -> [TxT]
+            # v1 -> [T x d]
+            # v2 -> [T x d]
+            # q2 -> [T x d]
+            # do -> [T x d]
+            # v1 x v2 -> [T x d x d]
+            # p @ (v1 x v2) -> T x d x d
+            # q2 @ p @ (v1 x v2) -> T x d 
+            # [d, 1] * [d, d]
+            # forward pass code:
+            # S_ = v1[:, :, None] * v2[:, None, :]
+            # S_ = tl.sum(p.to(tl.float16)[:, :, None, None] *  S_[None, :, :, :], axis = 1)
+            # acc *= acc_scale[:, None]
+            # acc += tl.sum(q2[:, :, None] * S_, axis = 1)
+
+
             # compute dp = dot(v, do)
             Di = tl.load(D_ptrs + offs_m_curr)
             dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - Di[:, None]
-            dp += tl.dot(do, tl.trans(v))
+            dp += tl.sum(tl.sum(dpv1v2[:, None, :, :] * v1v2[None, :, :, :], axis = 3), axis = 2)
             # compute ds = p * (dp - delta[:, None])
             ds = p * dp * sm_scale
             # compute dk = dot(ds.T, q)
-            dk += tl.dot(tl.trans(ds.to(Q.dtype.element_ty)), q)
-            # compute dq
-            dq = tl.load(dq_ptrs)
-            dq += tl.dot(ds.to(Q.dtype.element_ty), k)
-            tl.store(dq_ptrs, dq)
+            dk += tl.dot(tl.trans(ds.to(Q1.dtype.element_ty)), q1)
+            # compute dq1
+            dq1 = tl.load(dq1_ptrs)
+            dq1 += tl.dot(ds.to(Q1.dtype.element_ty), k)
+            tl.store(dq1_ptrs, dq1)
             # increment pointers
-            dq_ptrs += BLOCK_M * stride_qm
-            q_ptrs += BLOCK_M * stride_qm
-            do_ptrs += BLOCK_M * stride_qm
+            dq1_ptrs += BLOCK_M * stride_q1m
+            dq2_ptrs += BLOCK_M * stride_q2m
+            q1_ptrs += BLOCK_M * stride_q1m
+            q2_ptrs += BLOCK_M * stride_q2m
+            do_ptrs += BLOCK_M * stride_q1m
         # write-back
-        dv_ptrs = DV + (offs_n[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        dv1_ptrs = DV1 + (offs_n[:, None] * stride_q1m + offs_k[None, :] * stride_q1k)
+        dv2_ptrs = DV2 + (offs_n[:, None] * stride_q2m + offs_k[None, :] * stride_q2k)
         dk_ptrs = DK + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
-        tl.store(dv_ptrs, dv)
+        tl.store(dv1_ptrs, dv1)
+        tl.store(dv2_ptrs, dv2)
         tl.store(dk_ptrs, dk)
 
 
