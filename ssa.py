@@ -268,7 +268,7 @@ def _bwd_kernel(
             dv1v2 = tl.sum(p.to(tl.float16)[:, :, None, None] * dpv1v2[:, None, :, :], axis = 0)
             dv1 += tl.sum(dv1v2 * v2[:, None, :], axis = 2)
             dv2 += tl.sum(dv1v2 * v1[:, :, None], axis = 1)
-            
+
             # p -> [TxT]
             # v1 -> [T x d]
             # v2 -> [T x d]
@@ -355,7 +355,7 @@ class _attention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
-        BLOCK = 128
+        BLOCK = 64
         q1, q2, k, v1, v2, o, L = ctx.saved_tensors
         do = do.contiguous()
         dq1 = torch.zeros_like(q1, dtype=torch.float32)
