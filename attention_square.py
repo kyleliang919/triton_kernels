@@ -154,9 +154,8 @@ def _bwd_preprocess(
 @triton.jit
 def _bwd_kernel(
     Q1, Q2, K, V, sm_scale, Out, DO,
-    DQ1, DQ2, DK, DV1, DV2,
-    L1, L2,
-    D,
+    DQ1, DQ2, DK, DV,
+    L1, L2, D,
     stride_q1z, stride_q1h, stride_q1m, stride_q1k,
     stride_q2z, stride_q2h, stride_q2m, stride_q2k,
     stride_kz, stride_kh, stride_kn, stride_kk,
@@ -176,7 +175,7 @@ def _bwd_kernel(
     Q2 += off_z * stride_q2z + off_h * stride_q2h
     K += off_z * stride_q1z + off_h * stride_q1h
     V += off_z * stride_q1z + off_h * stride_q1h
-    DO += off_z * stride_qz + off_h * stride_q1h
+    DO += off_z * stride_q1z + off_h * stride_q1h
     DQ1 += off_z * stride_q1z + off_h * stride_q1h
     DQ2 += off_z * stride_q2z + off_h * stride_q2h
     DK += off_z * stride_q1z + off_h * stride_q1h
@@ -192,14 +191,17 @@ def _bwd_kernel(
         offs_m = tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_DMODEL)
         # initialize pointers to value-like data
-        q_ptrs = Q + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        q1_ptrs = Q1 + (offs_qm[:, None] * stride_q1m + offs_k[None, :] * stride_q1k)
+        q2_ptrs = Q2 + (offs_qm[:, None] * stride_q2m + offs_k[None, :] * stride_q2k)
         k_ptrs = K + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
-        v_ptrs = V + (offs_n[:, None] * stride_qm + offs_k[None, :] * stride_qk)
-        do_ptrs = DO + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
-        dq_ptrs = DQ + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        v_ptrs = V + (offs_n[:, None] * stride_q1m + offs_k[None, :] * stride_q1k)
+        do_ptrs = DO + (offs_qm[:, None] * stride_q1m + offs_k[None, :] * stride_q1k)
+        dq1_ptrs = DQ1 + (offs_qm[:, None] * stride_q1m + offs_k[None, :] * stride_q1k)
+        dq2_ptrs = DQ2 + (offs_qm[:, None] * stride_q2m + offs_k[None, :] * stride_q2k)
         # pointer to row-wise quantities in value-like data
         D_ptrs = D + off_hz * N_CTX
-        l_ptrs = L + off_hz * N_CTX
+        l1_ptrs = L1 + off_hz * N_CTX
+        l2_ptrs = L2 + off_hz * N_CTX
         # initialize dv amd dk
         dv = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
         dk = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
@@ -210,37 +212,51 @@ def _bwd_kernel(
         for start_m in range(lo, num_block * BLOCK_M, BLOCK_M):
             offs_m_curr = start_m + offs_m
             # load q, k, v, do on-chip
-            q = tl.load(q_ptrs)
+            q1 = tl.load(q1_ptrs)
+            q2 = tl.load(q2_ptrs)
             # recompute p = softmax(qk, dim=-1).T
             if CAUSAL:
-                qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), float(0.), float("-inf"))
+                qk1 = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), float(0.), float("-inf"))
+                qk2 = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), float(0.), float("-inf"))
             else:
-                qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-            qk += tl.dot(q, tl.trans(k))
-            qk *= qk_scale
-            l_i = tl.load(l_ptrs + offs_m_curr)
-            p = tl.math.exp2(qk - l_i[:, None])
+                qk1 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+                qk2 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+            qk1 += tl.dot(q1, tl.trans(k))
+            qk2 += tl.dot(q2, tl.trans(k))
+            qk1 *= qk_scale
+            qk2 *= qk_scale
+            l1_i = tl.load(l1_ptrs + offs_m_curr)
+            l2_i = tl.load(l2_ptrs + offs_m_curr)
+            p = tl.math.exp2(0.5*(qk1 + qk2 - (l1_i + l2_i)[:, None])) # computing the product sqaure in logspace
             # compute dv
             do = tl.load(do_ptrs)
-            dv += tl.dot(tl.trans(p.to(Q.dtype.element_ty)), do)
+            dv += tl.dot(tl.trans(p.to(Q1.dtype.element_ty)), do)
             # compute dp = dot(v, do)
             Di = tl.load(D_ptrs + offs_m_curr)
             dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - Di[:, None]
             dp += tl.dot(do, tl.trans(v))
             # compute ds = p * (dp - delta[:, None])
-            ds = p * dp * sm_scale
+            ds1 = p * dp * sm_scale
+            ds2 = p * dp * sm_scale
             # compute dk = dot(ds.T, q)
-            dk += tl.dot(tl.trans(ds.to(Q1.dtype.element_ty)), q)
+            dk += tl.dot(tl.trans(ds1.to(Q1.dtype.element_ty)), q1) + tl.dot(tl.trans(ds2.to(Q2.dtype.element_ty)), q2)
             # compute dq
-            dq = tl.load(dq_ptrs)
-            dq += tl.dot(ds.to(Q.dtype.element_ty), k)
-            tl.store(dq_ptrs, dq)
+            dq1 = tl.load(dq1_ptrs)
+            dq1 += tl.dot(ds1.to(Q1.dtype.element_ty), k)
+            tl.store(dq1_ptrs, dq1)
+            
+            dq2 = tl.load(dq2_ptrs)
+            dq2 += tl.dot(ds2.to(Q2.dtype.element_ty), k)
+            tl.store(dq2_ptrs, dq2)
+
             # increment pointers
-            dq_ptrs += BLOCK_M * stride_qm
-            q_ptrs += BLOCK_M * stride_qm
-            do_ptrs += BLOCK_M * stride_qm
+            dq1_ptrs += BLOCK_M * stride_q1m
+            q1_ptrs += BLOCK_M * stride_q1m
+            dq2_ptrs += BLOCK_M * stride_q2m
+            q2_ptrs += BLOCK_M * stride_q2m
+            do_ptrs += BLOCK_M * stride_q1m
         # write-back
-        dv_ptrs = DV + (offs_n[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        dv_ptrs = DV + (offs_n[:, None] * stride_q1m + offs_k[None, :] * stride_q1k)
         dk_ptrs = DK + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
         tl.store(dv_ptrs, dv)
         tl.store(dk_ptrs, dk)
@@ -290,33 +306,35 @@ class _attention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         BLOCK = 128
-        q, k, v, o, L = ctx.saved_tensors
+        q1, q2, k, v, o, L1, L2 = ctx.saved_tensors
         do = do.contiguous()
-        dq = torch.zeros_like(q, dtype=torch.float32)
+        dq1 = torch.zeros_like(q1, dtype=torch.float32)
+        dq2 = torch.zeros_like(q2, dtype=torch.float32)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
-        delta = torch.empty_like(L)
+        delta = torch.empty_like(L1)
         _bwd_preprocess[(ctx.grid[0] * ctx.grid[1], )](
             o, do,
             delta,
             BLOCK_M=BLOCK, D_HEAD=ctx.BLOCK_DMODEL,
         )
         _bwd_kernel[(ctx.grid[1],)](
-            q, k, v, ctx.sm_scale,
+            q1, q2, k, v, ctx.sm_scale,
             o, do,
-            dq, dk, dv,
-            L, delta,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            dq1, dq2, dk, dv,
+            L1, L2, delta,
+            q1.stride(0), q1.stride(1), q1.stride(2), q1.stride(3),
+            q2.stride(0), q2.stride(1), q2.stride(2), q2.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            q.shape[0], q.shape[1], q.shape[2],
+            q1.shape[0], q1.shape[1], q1.shape[2],
             ctx.grid[0],
             BLOCK_M=BLOCK, BLOCK_N=BLOCK,
             BLOCK_DMODEL=ctx.BLOCK_DMODEL, num_warps=8,
             CAUSAL=ctx.causal,
             num_stages=1,
         )
-        return dq, dk, dv, None, None
+        return dq1, dq2, dk, dv, None, None
 
 
 attention_sq = _attention.apply
@@ -360,17 +378,15 @@ if __name__ == '__main__':
 
     o  = attention_sq(q1, q2, k, v, True, (DK**(-0.5)))
     o2 = attention_square(q1, q2, k, v, (DK**(-0.5)))
-    # do2 = torch.randn_like(o2)
-    # o2.backward(do2)
-    # q1_grad, q1.grad = q1.grad, None
-    # q2_grad, q2.grad = q2.grad, None  
-    # k_grad, k.grad = k.grad, None
-    # v1_grad, v1.grad = v1.grad, None
-    # v2_grad, v2.grad = v2.grad, None
-    # o.backward(do2)
+    do2 = torch.randn_like(o2)
+    o2.backward(do2)
+    q1_grad, q1.grad = q1.grad, None
+    q2_grad, q2.grad = q2.grad, None  
+    k_grad, k.grad = k.grad, None
+    v_grad, v.grad = v.grad, None
+    o.backward(do2)
     print( (o - o2).abs().max())
-    # print( (q1.grad - q1_grad).abs().max())
-    # print( (q2.grad - q2_grad).abs().max())
-    # print( (k.grad - k_grad).abs().max())
-    # print( (v1.grad - v1_grad).abs().max())
-    # print( (v2.grad - v2_grad).abs().max())
+    print( (q1.grad - q1_grad).abs().max())
+    print( (q2.grad - q2_grad).abs().max())
+    print( (k.grad - k_grad).abs().max())
+    print( (v.grad - v_grad).abs().max())

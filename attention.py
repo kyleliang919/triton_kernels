@@ -126,7 +126,7 @@ def _bwd_preprocess(
 
 @triton.jit
 def _bwd_kernel(
-    Q1, Q2, K, V1, V2, sm_scale, Out, DO,
+    Q, K, V, sm_scale, Out, DO,
     DQ1, DQ2, DK, DV1, DV2,
     L,
     D,
