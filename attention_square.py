@@ -159,7 +159,7 @@ def _bwd_kernel(
     stride_q1z, stride_q1h, stride_q1m, stride_q1k,
     stride_q2z, stride_q2h, stride_q2m, stride_q2k,
     stride_kz, stride_kh, stride_kn, stride_kk,
-    stride_vz, stride_vh, stride_vk, stride_vn,
+    stride_vz, stride_v, stride_vk, stride_vn,
     Z, H, N_CTX,
     num_block,
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
@@ -227,20 +227,23 @@ def _bwd_kernel(
             qk2 *= qk_scale
             l1_i = tl.load(l1_ptrs + offs_m_curr)
             l2_i = tl.load(l2_ptrs + offs_m_curr)
-            p = tl.math.exp2(0.5*(qk1 + qk2 - (l1_i + l2_i)[:, None])) # computing the product sqaure in logspace
+            p1 = tl.math.exp2(qk1 - l1_i[:, None])
+            p2 = tl.math.exp2(qk2 - l2_i[:, None])
+            p = tl.sqrt(p1 * p2) # computing the product sqaure in logspace
             # compute dv
             do = tl.load(do_ptrs)
             dv += tl.dot(tl.trans(p.to(Q1.dtype.element_ty)), do)
             # compute dp = dot(v, do)
-            Di = tl.load(D_ptrs + offs_m_curr)
-            dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - Di[:, None]
+            # Di = tl.load(D_ptrs + offs_m_curr)
+            # dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - Di[:, None]
+            dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
             dp += tl.dot(do, tl.trans(v))
             # compute ds = p * (dp - delta[:, None])
-            ds1 = p * dp * sm_scale
-            ds2 = p * dp * sm_scale
+            ds1 = p * 0.5  * (dp - p1 * dp) * sm_scale
+            ds2 = p * 0.5  * (dp - p2 * dp) * sm_scale
             # compute dk = dot(ds.T, q)
             dk += tl.dot(tl.trans(ds1.to(Q1.dtype.element_ty)), q1) + tl.dot(tl.trans(ds2.to(Q2.dtype.element_ty)), q2)
-            # compute dq
+            # compute dqs
             dq1 = tl.load(dq1_ptrs)
             dq1 += tl.dot(ds1.to(Q1.dtype.element_ty), k)
             tl.store(dq1_ptrs, dq1)
@@ -369,8 +372,8 @@ if __name__ == '__main__':
     DV = 32
     require_grad = True
     dtype = torch.float16
-    q1 = (torch.rand(B, H, L, DK)).cuda().to(dtype)
-    q2 = (torch.rand(B, H, L, DV)).cuda().to(dtype)
+    q1 = (torch.ones(B, H, L, DK)).cuda().to(dtype)
+    q2 = (torch.ones(B, H, L, DV)).cuda().to(dtype)
     k = (torch.randn(B, H, L, DK)).cuda()
     k = torch.nn.functional.normalize(k, dim=-1, p=2).to(dtype)
     v = (torch.randn(B, H, L, DV)).cuda().to(dtype)
