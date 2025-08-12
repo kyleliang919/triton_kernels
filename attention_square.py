@@ -229,7 +229,7 @@ def _bwd_kernel(
             l2_i = tl.load(l2_ptrs + offs_m_curr)
             p1 = tl.math.exp2(qk1 - l1_i[:, None])
             p2 = tl.math.exp2(qk2 - l2_i[:, None])
-            p = tl.sqrt(p1 * p2) # computing the product sqaure in logspace
+            p = tl.sqrt(p1 * p2)
             # compute dv
             do = tl.load(do_ptrs)
             dv += tl.dot(tl.trans(p.to(Q1.dtype.element_ty)), do)
@@ -242,7 +242,8 @@ def _bwd_kernel(
             ds1 = p * 0.5  * (dp - p1 * dp) * sm_scale
             ds2 = p * 0.5  * (dp - p2 * dp) * sm_scale
             # compute dk = dot(ds.T, q)
-            dk += tl.dot(tl.trans(ds1.to(Q1.dtype.element_ty)), q1) + tl.dot(tl.trans(ds2.to(Q2.dtype.element_ty)), q2)
+            dk += tl.dot(tl.trans(ds1.to(Q1.dtype.element_ty)), q1)
+            dk += tl.dot(tl.trans(ds2.to(Q2.dtype.element_ty)), q2)
             # compute dqs
             dq1 = tl.load(dq1_ptrs)
             dq1 += tl.dot(ds1.to(Q1.dtype.element_ty), k)
@@ -311,8 +312,8 @@ class _attention(torch.autograd.Function):
         BLOCK = 128
         q1, q2, k, v, o, L1, L2 = ctx.saved_tensors
         do = do.contiguous()
-        dq1 = torch.zeros_like(q1, dtype=torch.float32)
-        dq2 = torch.zeros_like(q2, dtype=torch.float32)
+        dq1 = torch.zeros_like(q1, dtype=torch.float32).contiguous()
+        dq2 = torch.zeros_like(q2, dtype=torch.float32).contiguous()
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         delta = torch.empty_like(L1)
@@ -342,7 +343,7 @@ class _attention(torch.autograd.Function):
 
 attention_sq = _attention.apply
 
-# @torch.compile
+@torch.compile
 def attention_square(
     q1: torch.Tensor,
     q2: torch.Tensor,
@@ -356,12 +357,12 @@ def attention_square(
   M = torch.tril(torch.ones((l, l), device="cuda"))
   p1 = torch.matmul(q1, k.transpose(2, 3)) * sm_scale
   p1[:, :, M == 0] = float("-inf")
-  p1 = torch.softmax(p1.float(), dim=-1).half()
+  p1 = torch.softmax(p1.float() - p1.float().amax(-1, keepdim = True), dim=-1)
 
   p2 = torch.matmul(q2, k.transpose(2, 3)) * sm_scale
   p2[:, :, M == 0] = float("-inf")
-  p2 = torch.softmax(p2.float(), dim=-1).half()
-  o = torch.matmul(torch.sqrt(p1 * p2), v.half())
+  p2 = torch.softmax(p2.float() - p2.float().amax(-1, keepdim = True), dim=-1)
+  o = torch.matmul(torch.sqrt(p1 * p2 + 1e-8), v)
   return o
 
 if __name__ == '__main__':
@@ -372,8 +373,8 @@ if __name__ == '__main__':
     DV = 32
     require_grad = True
     dtype = torch.float16
-    q1 = (torch.ones(B, H, L, DK)).cuda().to(dtype)
-    q2 = (torch.ones(B, H, L, DV)).cuda().to(dtype)
+    q1 = (torch.randn(B, H, L, DK)).cuda().to(dtype)
+    q2 = (torch.randn(B, H, L, DK)).cuda().to(dtype)
     k = (torch.randn(B, H, L, DK)).cuda()
     k = torch.nn.functional.normalize(k, dim=-1, p=2).to(dtype)
     v = (torch.randn(B, H, L, DV)).cuda().to(dtype)
